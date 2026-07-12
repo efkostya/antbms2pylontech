@@ -42,7 +42,7 @@
 
 ## 🚀 Установка и первый запуск
 
-1. Откройте файл `ESP32_BMS_Gateway.ino` в Arduino IDE.
+1. Откройте файл `esp32_ANTBMS_to_Pylontech.ino` в Arduino IDE.
 2. Установите необходимые библиотеки (если еще не установлены): `PubSubClient`, `Preferences`, `WebServer`.
 3. В начале кода измените параметры Wi-Fi на свои:
    ```cpp
