@@ -29,13 +29,13 @@ uint8_t antBuffer[ANT_PACKET_SIZE];
 String pylonInputBuffer = "";
 
 // --- НАСТРОЙКИ WI-FI И MQTT ---
-const char* WIFI_SSID = "Ваш SSID";
-const char* WIFI_PASSWORD = "password";
+const char* WIFI_SSID = "TSPNET";
+const char* WIFI_PASSWORD = "059hfBML";
 const unsigned long WIFI_TIMEOUT_MS = 15000; 
 
 const int MQTT_PORT = 1883;
-const char* MQTT_USER = "";               
-const char* MQTT_PASS = "";               
+const char* MQTT_USER = "efko@bk.ru";               
+const char* MQTT_PASS = "kolbaska";               
 const char* MQTT_CLIENT_ID = "ESP32_BMS_Gateway";
 
 unsigned long lastMqttReconnectAttempt = 0;
@@ -111,11 +111,15 @@ struct PylonConfig {
   String mqtt_topic = "antesp32/BMS/";
 
   // ---> НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ СЧЕТЧИКОВ ЭНЕРГИИ <---
-  double total_charge_kwh = 0;
-  double total_discharge_kwh = 0;
+  double total_charge_kwh = 111.0;
+  double total_discharge_kwh = 130.0;
 };
 
 PylonConfig config;
+
+// --- НАСТРОЙКИ FREERTOS ---
+TaskHandle_t InverterTaskHandle;
+SemaphoreHandle_t logMutex;
 
 // --- ВЕБ-ИНТЕРФЕЙС (HTML) ---
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -147,88 +151,126 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <body>
   <h2>Статус АКБ (ANT BMS)</h2>
   <div class="card">
-    <div class="stat">Общее напряжение: <span>%V_TOT% В</span></div>
-    <div class="stat">Текущий ток:(полож - разряд) <span>%I_CUR% А</span></div>
-    <div class="stat">Уровень заряда (SoC): <span>%SOC% %</span></div>
-    <div class="stat">Полная емкость: <span>%T_CAP_AH% Ач</span></div>
-    <div class="stat">Остаток емкости: <span>%R_CAP_AH% Ач</span></div>
-    <div class="stat">Количество циклов: <span>%CYCLES%</span></div>
-    <div class="stat">Мощность:(полож - разряд) <span>%POW% Вт</span></div>
-    <div class="stat">Всего заряжено: <span>%TOT_CH% кВт·ч</span></div>
-    <div class="stat">Всего разряжено: <span>%TOT_DIS% кВт·ч</span></div>
-    <div class="stat">Зарядный MOSFET: %MOSFET_CH%</div>
-    <div class="stat">Разрядный MOSFET: %MOSFET_DISCH%</div>
-    <div class="stat">Статус балансира: %BAL_STAT%</div>
-    <div class="stat">Флаги инвертору (0x92): <span>%CD_STATUS%</span></div>
-    <div class="stat">Статус (Pylontech): <span>%STATUS%</span></div>
-    %MANUAL_WARNING%
+    <div class="stat">Общее напряжение: <span><span id="v_tot">--</span> В</span></div>
+    <div class="stat">Текущий ток: <span><span id="i_cur">--</span> А</span></div>
+    <div class="stat">Мощность: <span><span id="pow">--</span> Вт</span></div>
+    <div class="stat">Уровень заряда (SoC): <span><span id="soc">--</span> %</span></div>
+    <div class="stat">Полная емкость: <span><span id="t_cap">--</span> Ач</span></div>
+    <div class="stat">Остаток емкости: <span><span id="r_cap">--</span> Ач</span></div>
+    <div class="stat">Количество циклов: <span id="cycles">--</span></div>
+    <div class="stat">Всего заряжено: <span><span id="tot_ch">--</span> кВт&middot;ч</span></div>
+    <div class="stat">Всего разряжено: <span><span id="tot_dis">--</span> кВт&middot;ч</span></div>
+    <div class="stat">Зарядный MOSFET: <span id="mosfet_ch">--</span></div>
+    <div class="stat">Разрядный MOSFET: <span id="mosfet_disch">--</span></div>
+    <div class="stat">Статус балансира: <span id="bal_stat">--</span></div>
+    <div class="stat">Флаги инвертору (0x92): <span id="cd_status">--</span></div>
+    <div class="stat">Статус (Pylontech): <span id="status">--</span></div>
+    <div id="manual_warning"></div>
   </div>
 
   <h2>Журнал запросов Инвертора</h2>
   <div class="card">
-    <div class="log-box">
-      %INV_LOG%
-    </div>
+    <div class="log-box" id="inv_log">Ожидание команд от инвертора...</div>
   </div>
 
   <h2>Ручное управление</h2>
   <div class="card">
     <form action="/toggle_fc" method="POST">
-      <input type="submit" value="%FC_BTN_TEXT%" style="background: %FC_BTN_COLOR%; color: #fff;">
+      <input type="submit" id="fc_btn" value="Загрузка..." style="background: #888; color: #fff;">
     </form>
   </div>
 
   <h2>Ячейки и Температура</h2>
   <div class="card">
     <div style="font-weight: bold; margin-bottom: 5px;">Напряжения ячеек:</div>
-    <div class="badge-grid">%CELLS_HTML%</div>
+    <div class="badge-grid" id="cells_html">Загрузка...</div>
     <div style="font-weight: bold; margin-top: 15px; margin-bottom: 5px;">Датчики температуры:</div>
-    <div class="badge-grid">%TEMPS_HTML%</div>
+    <div class="badge-grid" id="temps_html">Загрузка...</div>
   </div>
 
   <h2>Системные Настройки</h2>
   <form action="/save" method="POST" class="card">
     <h3>Связь MQTT</h3>
     <label>IP-адрес брокера:</label>
-    <input type="text" name="mqtt_ip" value="%MQTT_IP%">
+    <input type="text" name="mqtt_ip" id="mqtt_ip">
     <label>Префикс топиков (например, antesp32/BMS/):</label>
-    <input type="text" name="mqtt_topic" value="%MQTT_TOPIC%">
+    <input type="text" name="mqtt_topic" id="mqtt_topic">
 
     <h3 style="margin-top: 25px;">Лимиты Инвертора</h3>
     <label>Лимит напряжения заряда (мВ):</label>
-    <input type="number" name="cv_lim" value="%CV_LIM%">
+    <input type="number" name="cv_lim" id="cv_lim">
     <label>Лимит напряжения разряда (мВ):</label>
-    <input type="number" name="dv_lim" value="%DV_LIM%">
+    <input type="number" name="dv_lim" id="dv_lim">
     <label>Лимит тока заряда (в 100 мА, 1000 = 100А):</label>
-    <input type="number" name="cc_lim" value="%CC_LIM%">
+    <input type="number" name="cc_lim" id="cc_lim">
     <label>Лимит тока разряда (Отрицательный, в 100 мА):</label>
-    <input type="number" name="dc_lim" value="%DC_LIM%">
+    <input type="number" name="dc_lim" id="dc_lim">
     
     <h3 style="margin-top: 25px; color: #28a745;">Условия Остановки Заряда</h3>
     <label style="color: #28a745;">Остановить заряд от инвертора при SoC (%):</label>
-    <input type="number" name="max_soc" value="%MAX_SOC%" max="100" min="10">
+    <input type="number" name="max_soc" id="max_soc" max="100" min="10">
 
     <h3 style="margin-top: 25px; color: #d32f2f;">Условия Force Charge</h3>
     <label style="color: #d32f2f;">Включить заряд от сети при SoC ниже (%):</label>
-    <input type="number" name="fc_soc" value="%FC_SOC%">
+    <input type="number" name="fc_soc" id="fc_soc">
     <label style="color: #d32f2f;">Включить заряд при просадке ячейки ниже (мВ):</label>
-    <input type="number" name="fc_cell" value="%FC_CELL%">
+    <input type="number" name="fc_cell" id="fc_cell">
     
     <input type="submit" value="Сохранить настройки">
     <div style="text-align: center; margin-top: 20px;">
       <a href="/update" style="color: #0056b3; font-weight: bold; text-decoration: underline;">Обновление прошивки (Web OTA)</a>
     </div>
   </form>
-  </form>
 
   <script>
-    setInterval(function(){
-      // Если пользователь сфокусирован на текстовом или числовом поле ввода, отменяем рефреш
-      if(document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA')) {
-        return; 
-      }
-      location.reload();
-    }, 3000); // 3000 миллисекунд = 3 секунды
+    function updateData() {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/data', true);
+      xhr.onload = function() {
+        if(xhr.status == 200) {
+          var data = JSON.parse(xhr.responseText);
+          document.getElementById('v_tot').innerHTML = data.v_tot;
+          document.getElementById('i_cur').innerHTML = data.i_cur;
+          document.getElementById('soc').innerHTML = data.soc;
+          document.getElementById('t_cap').innerHTML = data.t_cap;
+          document.getElementById('r_cap').innerHTML = data.r_cap;
+          document.getElementById('cycles').innerHTML = data.cycles;
+          document.getElementById('tot_ch').innerHTML = data.tot_ch;
+          document.getElementById('tot_dis').innerHTML = data.tot_dis;
+          document.getElementById('pow').innerHTML = data.pow;
+          
+          document.getElementById('mosfet_ch').innerHTML = data.mosfet_ch;
+          document.getElementById('mosfet_disch').innerHTML = data.mosfet_disch;
+          document.getElementById('bal_stat').innerHTML = data.bal_stat;
+          document.getElementById('cd_status').innerHTML = data.cd_status;
+          document.getElementById('status').innerHTML = data.status;
+          document.getElementById('manual_warning').innerHTML = data.manual_warning;
+          
+          document.getElementById('fc_btn').value = data.fc_btn_text;
+          document.getElementById('fc_btn').style.background = data.fc_btn_color;
+          
+          document.getElementById('inv_log').innerHTML = data.inv_log;
+          document.getElementById('cells_html').innerHTML = data.cells_html;
+          document.getElementById('temps_html').innerHTML = data.temps_html;
+
+          if(!window.inputsLoaded) {
+            document.getElementById('mqtt_ip').value = data.mqtt_ip;
+            document.getElementById('mqtt_topic').value = data.mqtt_topic;
+            document.getElementById('cv_lim').value = data.cv_lim;
+            document.getElementById('dv_lim').value = data.dv_lim;
+            document.getElementById('cc_lim').value = data.cc_lim;
+            document.getElementById('dc_lim').value = data.dc_lim;
+            document.getElementById('max_soc').value = data.max_soc;
+            document.getElementById('fc_soc').value = data.fc_soc;
+            document.getElementById('fc_cell').value = data.fc_cell;
+            window.inputsLoaded = true;
+          }
+        }
+      };
+      xhr.send();
+    }
+    updateData(); 
+    setInterval(updateData, 2000); 
   </script>
 </body>
 </html>
@@ -307,29 +349,26 @@ void saveSettings() {
   preferences.end();
 }
 
-void handleRoot() {
-  String html = String(INDEX_HTML);
-  html.replace("%V_TOT%", String(config.total_voltage / 1000.0, 2));
-  html.replace("%I_CUR%", String(config.current / - 10.0, 1));
-  html.replace("%SOC%", String(config.soc));
-  html.replace("%T_CAP_AH%", String(config.real_total_capacity / 1000.0, 1));
-  html.replace("%R_CAP_AH%", String(config.real_remaining_capacity / 1000.0, 1));
-  html.replace("%CYCLES%", String(config.cycles));
-  html.replace("%POW%", String(config.power));
-  html.replace("%TOT_CH%", String(config.total_charge_kwh, 2));
-  html.replace("%TOT_DIS%", String(config.total_discharge_kwh, 2));
+// Отдача сырого JSON для веб-страницы (работает молниеносно, без нагрузки)
+void handleApiData() {
+  String json = "{";
+  json += "\"v_tot\":\"" + String(config.total_voltage / 1000.0, 2) + "\",";
+  json += "\"i_cur\":\"" + String(config.current / -10.0, 1) + "\",";
+  json += "\"soc\":\"" + String(config.soc) + "\",";
+  json += "\"t_cap\":\"" + String(config.real_total_capacity / 1000.0, 1) + "\",";
+  json += "\"r_cap\":\"" + String(config.real_remaining_capacity / 1000.0, 1) + "\",";
+  json += "\"cycles\":\"" + String(config.cycles) + "\",";
+  json += "\"tot_ch\":\"" + String(config.total_charge_kwh, 2) + "\",";
+  json += "\"tot_dis\":\"" + String(config.total_discharge_kwh, 2) + "\",";
+  json += "\"pow\":\"" + String(config.power) + "\",";
   
   String chSt = (config.mosfet_charge_st < 16) ? MOSFET_Charge_St[config.mosfet_charge_st] : "Unknown";
   String dischSt = (config.mosfet_discharge_st < 16) ? MOSFET_Discharge_St[config.mosfet_discharge_st] : "Unknown";
   String balSt = (config.bal_st < 11) ? Bal_St[config.bal_st] : "Unknown";
-
-  String chHtml = (config.mosfet_charge_st == 1) ? "<span style='color: #28a745;'>ON</span>" : "<span class='alert'>" + chSt + "</span>";
-  String dischHtml = (config.mosfet_discharge_st == 1) ? "<span style='color: #28a745;'>ON</span>" : "<span class='alert'>" + dischSt + "</span>";
-  String balHtml = (config.bal_st == 4) ? "<span style='color: #ff9800;'>ACTIVE</span>" : "<span>" + balSt + "</span>";
-
-  html.replace("%MOSFET_CH%", chHtml);
-  html.replace("%MOSFET_DISCH%", dischHtml);
-  html.replace("%BAL_STAT%", balHtml);
+  
+  json += "\"mosfet_ch\":\"" + String((config.mosfet_charge_st == 1) ? "<span style='color: #28a745;'>ON</span>" : "<span class='alert'>" + chSt + "</span>") + "\",";
+  json += "\"mosfet_disch\":\"" + String((config.mosfet_discharge_st == 1) ? "<span style='color: #28a745;'>ON</span>" : "<span class='alert'>" + dischSt + "</span>") + "\",";
+  json += "\"bal_stat\":\"" + String((config.bal_st == 4) ? "<span style='color: #ff9800;'>ACTIVE</span>" : "<span>" + balSt + "</span>") + "\",";
 
   bool charge_enable = (config.mosfet_charge_st == 1) && (config.soc < config.max_soc_threshold);
   byte cd_status = 0x00;
@@ -342,59 +381,56 @@ void handleRoot() {
   if (cdHex.length() < 2) cdHex = "0" + cdHex;
 
   String ch_text = charge_enable ? "Да" : ((config.soc >= config.max_soc_threshold) ? "Нет (Лимит SoC)" : "Нет (Блок BMS)");
-  String cdStr = "0x" + cdHex + " (Заряд: " + ch_text + 
-                 ", Разряд: " + ((cd_status & (1 << 6)) ? "Да" : "Нет") +
-                 ", Force: " + ((cd_status & (1 << 5)) ? "Да" : "Нет") + ")";
-  html.replace("%CD_STATUS%", cdStr);
+  String cdStr = "0x" + cdHex + " (Заряд: " + ch_text + ", Разряд: " + ((cd_status & (1 << 6)) ? "Да" : "Нет") + ", Force: " + ((cd_status & (1 << 5)) ? "Да" : "Нет") + ")";
+  json += "\"cd_status\":\"" + cdStr + "\",";
 
-  String statTxt = (config.status == STATUS_FORCE_CHARGE) ? "<span class='alert'>FORCE CHARGE АКТИВЕН</span>" : "Норма";
-  html.replace("%STATUS%", statTxt);
+  String statTxt = (config.status == STATUS_FORCE_CHARGE) ? "<span class='alert'>FORCE CHARGE АКТИВЕН</span>" : "Норма (0xC0)";
+  json += "\"status\":\"" + statTxt + "\",";
 
   String manualWarning = config.manual_force_charge ? "<div class='manual-alert'>Внимание: Включен РУЧНОЙ режим Force Charge!</div>" : "";
-  html.replace("%MANUAL_WARNING%", manualWarning);
+  json += "\"manual_warning\":\"" + manualWarning + "\",";
   
-  String fcBtnText = config.manual_force_charge ? "Отключить ручной Force Charge" : "Включить ручной Force Charge";
-  String fcBtnColor = config.manual_force_charge ? "#dc3545" : "#ff9800"; 
-  html.replace("%FC_BTN_TEXT%", fcBtnText);
-  html.replace("%FC_BTN_COLOR%", fcBtnColor);
-  
-  // Вставка журнала инвертора
+  json += "\"fc_btn_text\":\"" + String(config.manual_force_charge ? "Отключить ручной Force Charge" : "Включить ручной Force Charge") + "\",";
+  json += "\"fc_btn_color\":\"" + String(config.manual_force_charge ? "#dc3545" : "#ff9800") + "\",";
+
   String logHtml = "";
-  for (int i = 0; i < 6; i++) {
-    if (inverter_log[i] != "") {
-      logHtml += inverter_log[i] + "<br>";
+  // Захватываем мьютекс перед чтением массива
+  if (xSemaphoreTake(logMutex, portMAX_DELAY)) {
+    for (int i = 0; i < 6; i++) {
+      if (inverter_log[i] != "") logHtml += inverter_log[i] + "<br>";
     }
+    xSemaphoreGive(logMutex); // Отпускаем мьютекс
   }
   if (logHtml == "") logHtml = "<i>Ожидание команд от инвертора...</i>";
-  html.replace("%INV_LOG%", logHtml);
-  
+  json += "\"inv_log\":\"" + logHtml + "\",";
+
   String cellsHtml = "";
   for (int i = 0; i < NUM_CELLS; i++) {
     float cellVoltage = config.voltages[i] / 1000.0;
     String colorStyle = (config.voltages[i] > 1000 && config.voltages[i] < config.fc_cell_threshold) ? "color: red;" : "";
     cellsHtml += "<div class='badge'>Яч. " + String(i + 1) + "<span style='" + colorStyle + "'>" + String(cellVoltage, 3) + " В</span></div>";
   }
-  html.replace("%CELLS_HTML%", cellsHtml);
+  json += "\"cells_html\":\"" + cellsHtml + "\",";
 
   String tempsHtml = "";
   for (int i = 0; i < 5; i++) {
     float tempCelsius = config.temperatures[i] / 10.0;
     tempsHtml += "<div class='badge'>Дат. " + String(i + 1) + "<span>" + String(tempCelsius, 1) + " &deg;C</span></div>";
   }
-  html.replace("%TEMPS_HTML%", tempsHtml);
-  
-  html.replace("%CV_LIM%", String(config.charge_voltage_limit));
-  html.replace("%DV_LIM%", String(config.discharge_voltage_limit));
-  html.replace("%CC_LIM%", String(config.charge_current_limit));
-  html.replace("%DC_LIM%", String(config.discharge_current_limit));
-  html.replace("%MAX_SOC%", String(config.max_soc_threshold));
-  html.replace("%FC_SOC%", String(config.fc_soc_threshold));
-  html.replace("%FC_CELL%", String(config.fc_cell_threshold));
-  
-  html.replace("%MQTT_IP%", config.mqtt_ip);
-  html.replace("%MQTT_TOPIC%", config.mqtt_topic);
-  
-  server.send(200, "text/html", html);
+  json += "\"temps_html\":\"" + tempsHtml + "\",";
+
+  json += "\"mqtt_ip\":\"" + config.mqtt_ip + "\",";
+  json += "\"mqtt_topic\":\"" + config.mqtt_topic + "\",";
+  json += "\"cv_lim\":\"" + String(config.charge_voltage_limit) + "\",";
+  json += "\"dv_lim\":\"" + String(config.discharge_voltage_limit) + "\",";
+  json += "\"cc_lim\":\"" + String(config.charge_current_limit) + "\",";
+  json += "\"dc_lim\":\"" + String(config.discharge_current_limit) + "\",";
+  json += "\"max_soc\":\"" + String(config.max_soc_threshold) + "\",";
+  json += "\"fc_soc\":\"" + String(config.fc_soc_threshold) + "\",";
+  json += "\"fc_cell\":\"" + String(config.fc_cell_threshold) + "\"";
+  json += "}";
+
+  server.send(200, "application/json", json);
 }
 
 void handleSave() {
@@ -456,6 +492,29 @@ bool MQTT_Reconnect() {
   return false;
 }
 
+// --- ВЫДЕЛЕННЫЙ ПОТОК ДЛЯ ИНВЕРТОРА (МАКСИМАЛЬНЫЙ ПРИОРИТЕТ) ---
+void InverterTask(void * parameter) {
+  for(;;) {
+    while (Serial2.available()) {
+      char inChar = (char)Serial2.read();
+      pylonInputBuffer += inChar;
+      
+      if (pylonInputBuffer.length() > 100) pylonInputBuffer = ""; // Защита от мусора
+
+      if (inChar == '\r') {
+        int tildeIndex = pylonInputBuffer.indexOf('~');
+        if (tildeIndex != -1) {
+          String cleanCmd = pylonInputBuffer.substring(tildeIndex); 
+          handleInverterCommand(cleanCmd);
+        }
+        pylonInputBuffer = ""; 
+      }
+    }
+    // Отдаем планировщику 5 мс, чтобы не заблокировать Watchdog таймер
+    vTaskDelay(5 / portTICK_PERIOD_MS); 
+  }
+}
+
 // --- ОТПРАВКА ДАННЫХ В MQTT С ДИНАМИЧЕСКИМ ПРЕФИКСОМ ---
 void publishTelemetryToMqtt() {
   if (!mqttClient.connected()) return;
@@ -498,7 +557,7 @@ void publishTelemetryToMqtt() {
 
   for (int i = 0; i < 5; i++) {
     char topic[64];
-    snprintf(topic, sizeof(topic), "%stemp%d", prefix.c_str(), i + 1);
+    snprintf(topic, sizeof(topic), "%sTemp%d", prefix.c_str(), i + 1);
     mqttClient.publish(topic, String(config.temperatures[i] / 10.0, 1).c_str());
   }
 
@@ -554,14 +613,15 @@ void assembleAndSendPylonResponse(byte ver, byte adr, byte cid1, byte cid2, byte
   
   String finalPacket = "~" + asciiStr + byteToHex((cs >> 8) & 0xFF) + byteToHex(cs & 0xFF) + "\r";
   
-  String debugTx = finalPacket;
-  debugTx.replace("\r", ""); 
-  Serial.println("[PYLON TX] " + debugTx);
+  //String debugTx = finalPacket;
+  //debugTx.replace("\r", ""); 
+  //Serial.println("[PYLON TX] " + debugTx);
 
   digitalWrite(RS485_DE_RE, HIGH);
-  delay(1); 
+  delay(2); 
   Serial2.print(finalPacket);
   Serial2.flush(); 
+  delay(2);
   digitalWrite(RS485_DE_RE, LOW);
   delete[] msgBytes;
 }
@@ -727,17 +787,19 @@ void addInverterLog(byte cid2) {
   String timeStr = String(upSec / 3600) + "ч " + String((upSec % 3600) / 60) + "м " + String(upSec % 60) + "с";
   String entry = "<span style='color: #0056b3;'>[" + timeStr + "]</span> Запрос: <b>" + cmdName + "</b>";
 
-  for (int i = 5; i > 0; i--) {
-    inverter_log[i] = inverter_log[i - 1];
+  // Захватываем мьютекс перед записью в массив
+  if (xSemaphoreTake(logMutex, portMAX_DELAY)) {
+    for (int i = 5; i > 0; i--) inverter_log[i] = inverter_log[i - 1];
+    inverter_log[0] = entry;
+    xSemaphoreGive(logMutex); // Отпускаем мьютекс
   }
-  inverter_log[0] = entry;
 }
 
 // --- ОБРАБОТКА КОМАНД ИНВЕРТОРА ---
 void handleInverterCommand(String cmd) {
-  String debugRx = cmd;
-  debugRx.replace("\r", ""); 
-  Serial.println("[PYLON RX] " + debugRx);
+ // String debugRx = cmd;
+// debugRx.replace("\r", ""); 
+  //Serial.println("[PYLON RX] " + debugRx);
 
   cmd.replace("~", "");
   cmd.trim();
@@ -1044,12 +1106,14 @@ byte status3 = 0x00;
 }
 
 void setup() {
+  logMutex = xSemaphoreCreateMutex();
   Serial.begin(115200); 
   
   Serial1.setRxBufferSize(256);
   Serial1.setTxBufferSize(256);
   Serial1.begin(19200, SERIAL_8N1, RXD1, TXD1);  
   
+  Serial2.setRxBufferSize(512);
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);  
   
   pinMode(RS485_DE_RE, OUTPUT);
@@ -1075,7 +1139,9 @@ void setup() {
   // Применяем IP брокера из сохраненных настроек
   mqttClient.setServer(config.mqtt_ip.c_str(), MQTT_PORT);
   
-  server.on("/", HTTP_GET, handleRoot);
+  // ВЕБ СЕРВЕР (Использует легкую AJAX-архитектуру)
+  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", INDEX_HTML); });
+  server.on("/api/data", HTTP_GET, handleApiData); // <--- ТОЧКА ВХОДА AJAX
   server.on("/save", HTTP_POST, handleSave);
   server.on("/toggle_fc", HTTP_POST, handleToggleFC);
   // ---> ДОБАВЛЕНЫ ОБРАБОТЧИКИ WEB OTA <---
@@ -1118,6 +1184,17 @@ void setup() {
 
   server.begin();
   Serial.println("HTTP сервер запущен");
+
+// Запуск выделенного потока для инвертора
+  xTaskCreatePinnedToCore(
+    InverterTask,       // Имя функции
+    "Inverter_Task",    // Системное имя задачи
+    8192,               // Размер выделенного стека (с запасом)
+    NULL,               // Параметры
+    5,                  // Высший приоритет (у стандартного loop() приоритет 1)
+    &InverterTaskHandle,// Указатель на дескриптор
+    1                   // Выполнять на ядре 1 (на ядре 0 живет радиомодуль Wi-Fi)
+  );
 }
 
 void loop() {
@@ -1139,32 +1216,41 @@ void loop() {
     }
   }
 
+// === НАЧАЛО НОВОГО БЛОКА ANT BMS ===
+
+// 1. Отправляем запрос BMS
   if (currentMillis - lastBmsRequestTime >= bmsInterval) {
     lastBmsRequestTime = currentMillis;
-    while(Serial1.available()) Serial1.read(); 
     Serial1.write(antRequest, 6); 
   }
 
-  while (Serial1.available() > 0 && Serial1.peek() != antHeader[0]) {
-    Serial1.read(); 
+  // 2. АСИНХРОННОЕ ЧТЕНИЕ ANT BMS (БЕЗ БЛОКИРОВОК И ЗАДЕРЖЕК CPU)
+  static int antRxIndex = 0;
+  static unsigned long lastAntRxTime = 0;
+
+  while (Serial1.available()) {
+    uint8_t b = Serial1.read();
+    lastAntRxTime = millis();
+
+    if (antRxIndex == 0 && b != 0xAA) continue;
+    if (antRxIndex == 1 && b != 0x55) { antRxIndex = 0; continue; }
+    if (antRxIndex == 2 && b != 0xAA) { antRxIndex = 0; continue; }
+    if (antRxIndex == 3 && b != 0xFF) { antRxIndex = 0; continue; }
+
+    antBuffer[antRxIndex++] = b;
+
+    if (antRxIndex == ANT_PACKET_SIZE) {
+      parseAntBmsData(); 
+      antRxIndex = 0;
+    }
   }
-  if (Serial1.available() >= ANT_PACKET_SIZE) {
-    Serial1.readBytes(antBuffer, ANT_PACKET_SIZE);
-    printHex(antBuffer, ANT_PACKET_SIZE);
-    parseAntBmsData(); 
-  }
+  // Сбрасываем "битый" пакет, если следующий байт не пришел за 100 мс
+  if (antRxIndex > 0 && millis() - lastAntRxTime > 100) antRxIndex = 0;
+
+  // === КОНЕЦ НОВОГО БЛОКА ANT BMS ===
 
   if (currentMillis - lastMqttPublishTime >= mqttPublishInterval) {
     lastMqttPublishTime = currentMillis;
     publishTelemetryToMqtt();
-  }
-
-  while (Serial2.available()) {
-    char inChar = (char)Serial2.read();
-    pylonInputBuffer += inChar;
-    if (inChar == '\r') {
-      if (pylonInputBuffer.indexOf('~') != -1) handleInverterCommand(pylonInputBuffer);
-      pylonInputBuffer = ""; 
-    }
   }
 }
